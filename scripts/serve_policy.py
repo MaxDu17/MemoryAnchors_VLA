@@ -1,7 +1,9 @@
 import dataclasses
 import enum
 import logging
+import signal
 import socket
+import sys
 
 import tyro
 
@@ -51,6 +53,10 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Task index for sequential LIBERO checkpoints (selects per-task norm stats). Inferred from
+    # `task_idx_*.txt` in the checkpoint dir when omitted.
+    task_idx: int | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -90,7 +96,10 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                task_idx=args.task_idx,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
@@ -114,9 +123,15 @@ def main(args: Args) -> None:
         port=args.port,
         metadata=policy_metadata,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logging.info("Policy server shutting down")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     main(tyro.cli(Args))

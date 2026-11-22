@@ -212,6 +212,7 @@ def main(config: _config.TrainConfig):
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
+        max_to_keep=config.max_to_keep,
         overwrite=config.overwrite,
         resume=config.resume,
     )
@@ -226,10 +227,12 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
+    # Log images from first batch to sanity check. Gather sharded arrays to host first;
+    # indexing FSDP-sharded JAX arrays before device_get causes CUDA illegal memory access.
+    batch_images = jax.device_get(batch[0].images)
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([np.array(img[i]) for img in batch_images.values()], axis=1))
+        for i in range(min(5, len(next(iter(batch_images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 

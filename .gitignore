@@ -3,11 +3,15 @@ assets/
 checkpoints/
 data/
 wandb/
+batch_scripts_tmp/
+outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+
 
 # C extensions
 *.so

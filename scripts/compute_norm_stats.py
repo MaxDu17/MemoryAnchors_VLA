@@ -3,6 +3,8 @@
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
+
+For sequential configs (LeRobotLiberoSeqDataConfig), stats are computed per task.
 """
 
 import numpy as np
@@ -21,6 +23,16 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
+def iter_task_data_configs(cfg: _config.TrainConfig):
+    """Yield (task_idx, DataConfig) pairs for sequential or standard configs."""
+    data_factory = cfg.data
+    if hasattr(data_factory, "repo_ids") and data_factory.repo_ids:
+        for idx in range(len(data_factory.repo_ids)):
+            yield idx, data_factory.create(cfg.assets_dirs, cfg.model, task_id=idx)
+    else:
+        yield 0, data_factory.create(cfg.assets_dirs, cfg.model)
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -37,7 +49,6 @@ def create_torch_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
         ],
     )
@@ -69,7 +80,6 @@ def create_rlds_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
         ],
         is_batched=True,
@@ -77,7 +87,6 @@ def create_rlds_dataloader(
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
     else:
-        # NOTE: this length is currently hard-coded for DROID.
         num_batches = len(dataset) // batch_size
     data_loader = _data_loader.RLDSDataLoader(
         dataset,
@@ -86,31 +95,45 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
-
+def compute_stats_for_data_config(
+    config: _config.TrainConfig,
+    data_config: _config.DataConfig,
+    max_frames: int | None,
+) -> dict[str, normalize.NormStats]:
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.model,
+            config.num_workers,
+            max_frames,
         )
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc=f"Computing stats ({data_config.repo_id})"):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    return {key: stat.get_statistics() for key, stat in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
-    print(f"Writing stats to: {output_path}")
-    normalize.save(output_path, norm_stats)
+
+def main(config_name: str, max_frames: int | None = None):
+    config = _config.get_config(config_name)
+
+    for task_idx, data_config in iter_task_data_configs(config):
+        norm_stats = compute_stats_for_data_config(config, data_config, max_frames)
+
+        asset_id = data_config.asset_id or data_config.repo_id
+        output_path = config.assets_dirs / asset_id
+        print(f"Writing stats for task {task_idx} to: {output_path}")
+        normalize.save(output_path, norm_stats)
 
 
 if __name__ == "__main__":

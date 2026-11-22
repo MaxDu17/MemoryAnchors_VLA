@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.replay_memory_budget as _replay_memory_budget
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -176,14 +177,25 @@ class DataConfigFactory(abc.ABC):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
 
-    def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+    def create_base_config(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+        *,
+        asset_id: str | None = None,
+    ) -> DataConfig:
+        """Build base DataConfig with norm stats.
+
+        `asset_id` overrides the assets subdirectory used for norm stats. Useful when
+        `repo_id` (data path under HF_LEROBOT_HOME) differs from the assets layout.
+        """
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        asset_id = self.assets.asset_id or repo_id
+        resolved_asset_id = asset_id or self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
-            asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            asset_id=resolved_asset_id,
+            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), resolved_asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -356,6 +368,67 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoSeqDataConfig(DataConfigFactory):
+    """Per-task LeRobot datasets for sequential / continual Libero training."""
+
+    repo_ids: tuple[str, ...] = dataclasses.field(default_factory=tuple)
+    extra_delta_transform: bool = True
+
+    @override
+    def create(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+        *,
+        task_id: int | None = None,
+    ) -> DataConfig:
+        if task_id is None:
+            raise ValueError(
+                "`task_id` must be provided when using LeRobotLiberoSeqDataConfig "
+                "(this factory is only meant for sequential training)."
+            )
+        repo_id = self.repo_ids[task_id]
+        # Norm stats live under assets_dir/{suite}/{task}, not the full HF_LEROBOT_HOME path.
+        asset_id = "/".join(repo_id.rsplit("/", 2)[-2:])
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config, asset_id=asset_id),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            repo_id=repo_id,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -509,11 +582,55 @@ class TrainConfig:
     num_workers: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
+    # Steps to train on each task during sequential training.
+    steps_per_task: int = 10
+
+    # Continual learning / sequential training settings.
+    cl: str = ""
+    n_tasks: int = 1
+    n_memories: int = 100 #1000
+    # When True, n_memories (or n_memories_proportion) applies to the whole replay buffer, not per task.
+    n_memories_total: bool = False
+    # When set, n_memories is ignored and this fraction of the pool is used instead (0, 1].
+    n_memories_proportion: float | None = None
+    double_batch_start: bool = False
+    no_resampling: bool = False
+    # LIBERO continual-learning task order: index into TASK_ORDERS (0–20) or explicit permutation.
+    task_order_index: int | None = None
+    task_order_permutation: tuple[int, ...] | None = None
+    learn_one_task_idx: int = -1
+
+    # Anchor-memory ER settings (used when cl == "er_anchor").
+    anchor_repr_mode: str = "prefix_embed"
+    anchor_action_ood_mode: str = "top_percent"
+    anchor_ood_top_percent: float = 25.0
+    anchor_std_cutoff: float = 2.0
+    anchor_flow_noise_level: float = 0.2
+    anchor_num_flow_steps: int = 10
+    anchor_rot_metric: str = "geodesic"
+    anchor_rot_weight: float = 0.1
+    anchor_n_neighbors: int = 5
+    anchor_consolidation: str = "median"
+    anchor_random_proportion: float = 0.6
+    anchor_invert_selection: bool = False
+    anchor_invert_remove_proportion: float = 0.05
+    anchor_baseline_max_samples_per_task: int | None = None
+    anchor_max_embedding_samples_per_task: int | None = None
+    anchor_chunk_size: int = 512
+
+    # Debug / dry-run mode for sequential training (overrides steps per task, batch size, etc.).
+    debug: bool = False
+    debug_steps_per_task: int = 5
+    debug_batch_size: int = 8
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # If true, only save checkpoints at the end of each sequential task (not every save_interval).
+    save_end_of_task_only: bool = False
+    # Maximum number of checkpoints to retain. None keeps all checkpoints on disk.
+    max_to_keep: int | None = 1
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -554,6 +671,105 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.n_memories_proportion is not None and not 0 < self.n_memories_proportion <= 1:
+            raise ValueError(
+                f"n_memories_proportion must be in (0, 1], got {self.n_memories_proportion}"
+            )
+
+    def resolve_replay_memory_budget(self, pool_sizes: Sequence[int]) -> int:
+        """Total replay frames to select across tasks with the given pool sizes."""
+        return _replay_memory_budget.resolve_replay_memory_budget(
+            pool_sizes,
+            n_memories=self.n_memories,
+            n_memories_total=self.n_memories_total,
+            n_memories_proportion=self.n_memories_proportion,
+        )
+
+    def resolve_per_task_memory_budgets(self, pool_sizes: Sequence[int]) -> list[int]:
+        """Per-task replay frame counts for plain ``er`` random subsampling."""
+        return _replay_memory_budget.resolve_per_task_memory_budgets(
+            pool_sizes,
+            n_memories=self.n_memories,
+            n_memories_total=self.n_memories_total,
+            n_memories_proportion=self.n_memories_proportion,
+        )
+
+    def effective_sequential_settings(self) -> "TrainConfig":
+        """Return config with debug overrides applied for sequential training."""
+        if not self.debug:
+            return self
+        return dataclasses.replace(
+            self,
+            steps_per_task=self.debug_steps_per_task,
+            batch_size=self.debug_batch_size,
+            save_interval=max(1, self.debug_steps_per_task),
+            log_interval=1,
+            wandb_enabled=False,
+            num_workers=0,
+            anchor_max_embedding_samples_per_task=128 if self.anchor_max_embedding_samples_per_task is None else self.anchor_max_embedding_samples_per_task,
+            anchor_baseline_max_samples_per_task=64 if self.anchor_baseline_max_samples_per_task is None else self.anchor_baseline_max_samples_per_task,
+            n_memories=(
+                min(self.n_memories, 32)
+                if self.n_memories_proportion is None and self.n_memories != -1
+                else self.n_memories
+            ),
+        )
+
+
+# Per-task repo paths relative to HF_LEROBOT_HOME (canonical LIBERO task index order).
+_LIBERO_BYTASK_PREFIX = "physical-intelligence/libero_bytask"
+
+_LIBERO_GOAL_SEQ_REPO_IDS = (
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/open_the_middle_drawer_of_the_cabinet",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/put_the_bowl_on_the_stove",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/put_the_wine_bottle_on_top_of_the_cabinet",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/open_the_top_drawer_and_put_the_bowl_inside",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/put_the_bowl_on_top_of_the_cabinet",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/push_the_plate_to_the_front_of_the_stove",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/put_the_cream_cheese_in_the_bowl",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/turn_on_the_stove",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/put_the_bowl_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_goal_no_noops/put_the_wine_bottle_on_the_rack",
+)
+
+_LIBERO_10_SEQ_REPO_IDS = (
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_both_the_cream_cheese_box_and_the_butter_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/turn_on_the_stove_and_put_the_moka_pot_on_it",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_both_moka_pots_on_the_stove",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops/put_the_yellow_and_white_mug_in_the_microwave_and_close_it",
+)
+
+_LIBERO_OBJECT_SEQ_REPO_IDS = (
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_alphabet_soup_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_cream_cheese_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_salad_dressing_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_bbq_sauce_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_ketchup_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_tomato_sauce_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_butter_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_milk_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_chocolate_pudding_and_place_it_in_the_basket",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops/pick_up_the_orange_juice_and_place_it_in_the_basket",
+)
+
+_LIBERO_SPATIAL_SEQ_REPO_IDS = (
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate",
+    f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops/pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate",
+)
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -695,6 +911,210 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_libero_low_mem_finetune-libero_goal_sequential",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id="physical-intelligence/libero_bytask/libero-libero_goal_no_noops",
+            repo_ids=_LIBERO_GOAL_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_libero_low_mem_finetune-libero_goal_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_libero-libero_goal_sequential",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id="physical-intelligence/libero_bytask/libero-libero_goal_no_noops",
+            repo_ids=_LIBERO_GOAL_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_libero-libero_goal_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=50_000,
+        steps_per_task=5_000, # used to be 10000
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+    ),
+    TrainConfig(
+        name="pi0_libero_low_mem_finetune-libero_10_sequential",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id=f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops",
+            repo_ids=_LIBERO_10_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_libero_low_mem_finetune-libero_10_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_libero_low_mem_finetune-libero_object_sequential",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id=f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops",
+            repo_ids=_LIBERO_OBJECT_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_libero_low_mem_finetune-libero_object_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_libero_low_mem_finetune-libero_spatial_sequential",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id=f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops",
+            repo_ids=_LIBERO_SPATIAL_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_libero_low_mem_finetune-libero_spatial_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_libero-libero_10_sequential",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id=f"{_LIBERO_BYTASK_PREFIX}/libero-libero_10_no_noops",
+            repo_ids=_LIBERO_10_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_libero-libero_10_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+    ),
+    TrainConfig(
+        name="pi05_libero-libero_object_sequential",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id=f"{_LIBERO_BYTASK_PREFIX}/libero-libero_object_no_noops",
+            repo_ids=_LIBERO_OBJECT_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_libero-libero_object_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
+    ),
+    TrainConfig(
+        name="pi05_libero-libero_spatial_sequential",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoSeqDataConfig(
+            repo_id=f"{_LIBERO_BYTASK_PREFIX}/libero-libero_spatial_no_noops",
+            repo_ids=_LIBERO_SPATIAL_SEQ_REPO_IDS,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_libero-libero_spatial_sequential",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=50_000,
+        steps_per_task=5_000,
+        save_end_of_task_only=True,
+        max_to_keep=None,
+        n_tasks=10,
     ),
     TrainConfig(
         name="pi0_fast_libero",

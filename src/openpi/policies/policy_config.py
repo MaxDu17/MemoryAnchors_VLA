@@ -13,6 +13,13 @@ from openpi.training import config as _config
 import openpi.transforms as transforms
 
 
+def _infer_task_idx_from_checkpoint(checkpoint_dir: pathlib.Path) -> int | None:
+    task_idx_files = sorted(checkpoint_dir.glob("task_idx_*.txt"))
+    if not task_idx_files:
+        return None
+    return max(int(path.read_text().strip()) for path in task_idx_files)
+
+
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -22,6 +29,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    task_idx: int | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +45,8 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        task_idx: Task index for sequential LIBERO configs (`LeRobotLiberoSeqDataConfig`). If omitted,
+            inferred from `task_idx_*.txt` in the checkpoint directory when present.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -44,6 +54,7 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    checkpoint_path = pathlib.Path(checkpoint_dir)
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
@@ -54,14 +65,26 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+        model = train_config.model.load(_model.restore_params(checkpoint_path / "params", dtype=jnp.bfloat16))
+
+    if isinstance(train_config.data, _config.LeRobotLiberoSeqDataConfig):
+        if task_idx is None:
+            task_idx = _infer_task_idx_from_checkpoint(checkpoint_path)
+        if task_idx is None:
+            raise ValueError(
+                "Sequential LIBERO checkpoint requires `task_idx` (pass `--task-idx` to serve_policy.py). "
+                "This selects per-task norm stats and transforms."
+            )
+        logging.info("Using sequential LIBERO task_idx=%s", task_idx)
+        data_config = train_config.data.create(train_config.assets_dirs, train_config.model, task_id=task_idx)
+    else:
+        data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+        norm_stats = _checkpoints.load_norm_stats(checkpoint_path / "assets", data_config.asset_id)
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:

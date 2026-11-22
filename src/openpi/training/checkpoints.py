@@ -18,7 +18,12 @@ import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    max_to_keep: int | None,
+    overwrite: bool,
+    resume: bool,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
@@ -43,9 +48,11 @@ def initialize_checkpoint_dir(
             "assets": CallbackHandler(),
             "train_state": ocp.PyTreeCheckpointHandler(),
             "params": ocp.PyTreeCheckpointHandler(),
+            "buffer_lst": ocp.PyTreeCheckpointHandler(),
+            "task_idx": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            max_to_keep=max_to_keep,
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
@@ -62,40 +69,85 @@ def initialize_checkpoint_dir(
     return mngr, resuming
 
 
+def latest_task_checkpoint_step(checkpoint_manager: ocp.CheckpointManager) -> int | None:
+    """Return the latest checkpoint step that was saved at the end of a sequential task."""
+    checkpoint_manager.reload()
+    ckpt_dir = epath.Path(checkpoint_manager.directory)
+    task_steps = [
+        step
+        for step in checkpoint_manager.all_steps(read=True)
+        if list((ckpt_dir / str(step)).glob("task_idx_*.txt"))
+    ]
+    return max(task_steps) if task_steps else None
+
+
 def save_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    task_loaders: list[_data_loader.DataLoader] | None = None,
+    *,
+    task_idx: int | None = None,
+    replay_loader: _data_loader.DataLoader | None = None,
+    buffer_lst: list[list[int]] | None = None,
 ):
-    def save_assets(directory: epath.Path):
-        # Save the normalization stats.
-        data_config = data_loader.data_config()
-        norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(directory / data_config.asset_id, norm_stats)
+    del replay_loader
 
-    # Split params that can be used for inference into a separate item.
+    if task_loaders is None:
+
+        def save_assets(directory: epath.Path):
+            data_config = data_loader.data_config()
+            norm_stats = data_config.norm_stats
+            if norm_stats is not None and data_config.asset_id is not None:
+                _normalize.save(directory / data_config.asset_id, norm_stats)
+
+        with at.disable_typechecking():
+            train_state, params = _split_params(state)
+        items = {
+            "assets": save_assets,
+            "train_state": train_state,
+            "params": {"params": params},
+        }
+        checkpoint_manager.save(step, items)
+        return
+
+    def save_assets(directory: epath.Path):
+        for loader in task_loaders:
+            data_config = loader.data_config()
+            norm_stats = data_config.norm_stats
+            if norm_stats is not None and data_config.asset_id is not None:
+                _normalize.save(directory / data_config.asset_id, norm_stats)
+
     with at.disable_typechecking():
         train_state, params = _split_params(state)
     items = {
         "assets": save_assets,
         "train_state": train_state,
         "params": {"params": params},
+        "buffer_lst": {"buffer_lst": buffer_lst if buffer_lst is not None else []},
+        "task_idx": {"task_idx": task_idx if task_idx is not None else -1},
     }
     checkpoint_manager.save(step, items)
+
+    if task_idx is not None:
+        checkpoint_manager.wait_until_finished()
+        ckpt_path = epath.Path(checkpoint_manager.directory) / str(step)
+        (ckpt_path / f"task_idx_{task_idx}.txt").write_text(str(task_idx))
 
 
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
-    data_loader: _data_loader.DataLoader,
+    data_loader: _data_loader.DataLoader | None,
     step: int | None = None,
-) -> training_utils.TrainState:
+    *,
+    restore_task_idx: bool = False,
+    restore_replay_buffer: bool = False,
+) -> training_utils.TrainState | tuple[training_utils.TrainState, int | None, list[list[int]] | None]:
     del data_loader
 
     with at.disable_typechecking():
-        # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
         restored = checkpoint_manager.restore(
             step,
@@ -104,7 +156,21 @@ def restore_state(
                 "params": {"params": params},
             },
         )
-    return _merge_params(restored["train_state"], restored["params"])
+    train_state = _merge_params(restored["train_state"], restored["params"])
+
+    if not restore_task_idx and not restore_replay_buffer:
+        return train_state
+
+    extra_items: dict[str, None] = {}
+    if restore_replay_buffer:
+        extra_items["buffer_lst"] = None
+    if restore_task_idx:
+        extra_items["task_idx"] = None
+
+    restored_extra = checkpoint_manager.restore(step, items=extra_items)
+    buffer_lst = restored_extra["buffer_lst"]["buffer_lst"] if restore_replay_buffer else None
+    task_idx = restored_extra["task_idx"]["task_idx"] if restore_task_idx else None
+    return train_state, task_idx, buffer_lst
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:

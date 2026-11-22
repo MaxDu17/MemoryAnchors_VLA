@@ -1,15 +1,22 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
+
+# Must be set before jax/tensorflow are imported (including in DataLoader workers).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+from torch.utils.data import ConcatDataset, Subset
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -127,6 +134,13 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _lerobot_dataset_root(data_config: _config.DataConfig) -> pathlib.Path:
+    """Resolve the on-disk LeRobot dataset directory for a DataConfig."""
+    repo_id = data_config.repo_id
+    assert repo_id is not None
+    return pathlib.Path(lerobot_dataset.HF_LEROBOT_HOME) / repo_id
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,9 +151,17 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    root = _lerobot_dataset_root(data_config)
+    if not (root / "meta" / "info.json").exists():
+        raise FileNotFoundError(
+            f"LeRobot dataset not found at {root}. "
+            "Set HF_LEROBOT_HOME to the parent directory of repo_id paths in the config."
+        )
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+        repo_id,
+        root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -393,6 +415,7 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        drop_last: bool = True,
     ):
         """Create a PyTorch data loader.
 
@@ -408,12 +431,19 @@ class TorchDataLoader:
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
             seed: The seed to use for shuffling the data.
+            drop_last: Whether to drop the last incomplete batch.
         """
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
+        if len(dataset) == 0:
+            raise ValueError("Dataset is empty.")
         if len(dataset) < local_batch_size:
-            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+            if drop_last:
+                raise ValueError(
+                    f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)})."
+                )
+            local_batch_size = len(dataset)
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -441,7 +471,7 @@ class TorchDataLoader:
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
+            drop_last=drop_last,
             generator=generator,
         )
 
@@ -538,3 +568,228 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+def create_data_loader_sequential(
+    config: _config.TrainConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+    task_id: int | None = None,
+    cust_batch_size: int | None = None,
+    framework: Literal["jax", "pytorch"] = "jax",
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a data loader for one task in sequential training."""
+    data_config = config.data.create(
+        config.assets_dirs,
+        config.model,
+        task_id=task_id,
+    )
+
+    batch_size = cust_batch_size if cust_batch_size is not None else config.batch_size
+
+    if data_config.rlds_data_dir is not None:
+        return create_rlds_data_loader(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            batch_size=batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+    return create_torch_data_loader(
+        data_config,
+        model_config=config.model,
+        action_horizon=config.model.action_horizon,
+        batch_size=batch_size,
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+        skip_norm_stats=skip_norm_stats,
+        framework=framework,
+    )
+
+
+def create_full_task_datasets(
+    config: _config.TrainConfig,
+    n_tasks: int,
+    *,
+    task_order: Iterable[int] | None = None,
+    skip_norm_stats: bool = False,
+    framework: Literal["jax", "pytorch"] = "jax",
+):
+    """Create full (unsubsampled) per-task datasets for anchor-memory ER."""
+    del framework
+    order = list(range(n_tasks)) if task_order is None else list(task_order)
+    assert len(order) == n_tasks, (
+        f"task_order length {len(order)} does not match n_tasks={n_tasks}"
+    )
+    dataset_lst: list[Dataset] = []
+    buffer_lst: list[list[int]] = []
+    for task_id in order:
+        data_config = config.data.create(config.assets_dirs, config.model, task_id=task_id)
+        dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
+        dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+        n = len(dataset)
+        buffer_lst.append(list(range(n)))
+        dataset_lst.append(dataset)
+    return dataset_lst, buffer_lst
+
+
+def build_replay_subsets(
+    full_dataset_lst: Sequence[Dataset],
+    buffer_lst: Sequence[list[int]],
+) -> list[Dataset]:
+    return [Subset(dataset, list(indices)) for dataset, indices in zip(full_dataset_lst, buffer_lst, strict=True)]
+
+
+def resample_replay_buffer_lst(
+    config: _config.TrainConfig,
+    pool_sizes: Sequence[int],
+    buffer_lst: list[list[int]],
+    replay_end: int,
+    *,
+    seed: int,
+) -> None:
+    """Resample ``buffer_lst[0:replay_end]`` using the current replay memory budget."""
+    budgets = config.resolve_per_task_memory_budgets(pool_sizes[:replay_end])
+    rng = np.random.default_rng(seed + replay_end * 1009)
+    for i in range(replay_end):
+        n = pool_sizes[i]
+        k = budgets[i]
+        if k >= n:
+            buffer_lst[i] = list(range(n))
+        elif k == 0:
+            buffer_lst[i] = []
+        else:
+            buffer_lst[i] = rng.choice(n, size=k, replace=False).tolist()
+
+
+def create_deterministic_buffer(
+    config: _config.TrainConfig,
+    n_tasks: int,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+    return_data_config: bool = False,
+    task_order: Iterable[int] | None = None,
+    preset_buffers: list[list[int]] | None = None,
+    framework: Literal["jax", "pytorch"] = "jax",
+):
+    """Load full per-task datasets and pre-sample replay indices (subsetting happens in ``build_replay_subsets``)."""
+    order = list(range(n_tasks)) if task_order is None else list(task_order)
+    assert len(order) == n_tasks, (
+        f"task_order length {len(order)} does not match n_tasks={n_tasks}"
+    )
+
+    data_config_lst = []
+    for task_id in order:
+        data_config = config.data.create(
+            config.assets_dirs,
+            config.model,
+            task_id=task_id,
+        )
+        data_config_lst.append(data_config)
+
+    dataset_lst = []
+    buffer_lst = []
+    pool_sizes: list[int] = []
+    datasets: list[Dataset] = []
+    for idx, data_config in enumerate(data_config_lst):
+        dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
+        dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+        datasets.append(dataset)
+        pool_sizes.append(len(dataset))
+
+    uses_dynamic_budget = config.n_memories_total or config.n_memories_proportion is not None
+    per_task_budgets = config.resolve_per_task_memory_budgets(pool_sizes)
+    for idx, dataset in enumerate(datasets):
+        n = pool_sizes[idx]
+        k = per_task_budgets[idx]
+        if preset_buffers is not None:
+            buffer = list(preset_buffers[idx])
+        elif uses_dynamic_budget:
+            buffer = []
+        elif k >= n:
+            buffer = list(range(n))
+        else:
+            buffer = np.random.choice(n, size=k, replace=False).tolist()
+
+        dataset_lst.append(dataset)
+        buffer_lst.append(buffer)
+
+    if return_data_config:
+        return dataset_lst, buffer_lst, data_config_lst
+    return dataset_lst, buffer_lst
+
+
+def create_torch_data_loader_replay_buffer(
+    dataset_lst: Sequence[Dataset],
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    action_horizon: int,
+    batch_size: int,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    skip_norm_stats: bool = False,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    framework: Literal["jax", "pytorch"] = "jax",
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a shuffled loader over concatenated replay-memory subsets."""
+    del skip_norm_stats, action_horizon, model_config
+    data_buffer = ConcatDataset(list(dataset_lst))
+
+    if framework == "pytorch":
+        local_batch_size = batch_size
+    else:
+        local_batch_size = batch_size // jax.process_count()
+
+    data_loader = TorchDataLoader(
+        data_buffer,
+        local_batch_size=local_batch_size,
+        sharding=None if framework == "pytorch" else sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        framework=framework,
+    )
+
+    return DataLoaderImpl(data_config, data_loader)
+
+
+def _concat_batches(a, b):
+    return jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=0), a, b)
+
+
+class MixedDataLoader:
+    """Concatenate current-task and replay batches along the batch dimension."""
+
+    def __init__(self, data_config, current_loader, replay_loader):
+        self._current_loader = current_loader
+        self._replay_loader = replay_loader
+        self._data_config = data_config
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    def _infinite(self, dataloader):
+        while True:
+            yield from dataloader
+
+    def __iter__(self):
+        replay_iter = self._infinite(self._replay_loader)
+        for cur_obs, cur_act in self._current_loader:
+            rep_obs, rep_act = next(replay_iter)
+            yield _concat_batches(cur_obs, rep_obs), _concat_batches(cur_act, rep_act)
