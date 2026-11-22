@@ -70,6 +70,14 @@ Memory anchors are the previous-task frames nearest to the new task's action-OOD
 before each new task with the current model. One training run (10 tasks × 5,000 steps) took about
 3.5 days on one GPU. Add `--debug` to any `train_sequential.py` command for a short dry run.
 
+**Variance across task orders.** Results depend on the order in which the tasks are learned, and different
+orders can give noticeably different numbers. The add-anchors experiments (`add_anchors_8020`,
+`add_anchors_9010`) vary more across orders than the others, so compare methods on the same task orders.
+
+**Removing anchors gives a stronger signal than adding them.** A random replay buffer already contains
+some memory anchors, so adding more helps in some task orders but not in others. Removing them has a
+consistent effect: forgetting increases in every task order we ran.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash experiments/train_rander_1pct.sh          # orders 0, 1, 2
 CUDA_VISIBLE_DEVICES=1 bash experiments/train_add_anchors_9010.sh 0   # order 0 only
