@@ -1,0 +1,117 @@
+# Full training config logged for the task-order-2 run of this experiment
+# (original run name: LiberoTrainPi05_RandER_01_order2). Reproduce with:
+#   bash experiments/train_rander_1pct.sh 2
+# Orders 0 and 1 differ only in exp_name and task_order_index.
+anchor_action_ood_mode: top_percent
+anchor_baseline_max_samples_per_task: null
+anchor_chunk_size: 512
+anchor_consolidation: median
+anchor_flow_noise_level: 0.2
+anchor_invert_remove_proportion: 0.05
+anchor_invert_selection: false
+anchor_max_embedding_samples_per_task: null
+anchor_n_neighbors: 5
+anchor_num_flow_steps: 10
+anchor_ood_top_percent: 25
+anchor_random_proportion: 0.6
+anchor_repr_mode: prefix_embed
+anchor_rot_metric: geodesic
+anchor_rot_weight: 0.1
+anchor_std_cutoff: 2
+assets_base_dir: ./assets
+batch_size: 32
+checkpoint_base_dir: ./checkpoints
+cl: er
+data:
+  assets:
+    asset_id: null
+    assets_dir: ./assets/pi05_libero-libero_goal_sequential
+  base_config:
+    action_sequence_keys:
+    - actions
+    action_space: null
+    asset_id: null
+    data_transforms:
+      inputs: []
+      outputs: []
+    datasets: []
+    model_transforms:
+      inputs: []
+      outputs: []
+    norm_stats: null
+    prompt_from_task: true
+    repack_transforms:
+      inputs: []
+      outputs: []
+    repo_id: null
+    rlds_data_dir: null
+    use_quantile_norm: false
+  extra_delta_transform: false
+  repo_id: physical-intelligence/libero_bytask/libero-libero_goal_no_noops
+  repo_ids:
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/open_the_middle_drawer_of_the_cabinet
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/put_the_bowl_on_the_stove
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/put_the_wine_bottle_on_top_of_the_cabinet
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/open_the_top_drawer_and_put_the_bowl_inside
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/put_the_bowl_on_top_of_the_cabinet
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/push_the_plate_to_the_front_of_the_stove
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/put_the_cream_cheese_in_the_bowl
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/turn_on_the_stove
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/put_the_bowl_on_the_plate
+  - physical-intelligence/libero_bytask/libero-libero_goal_no_noops/put_the_wine_bottle_on_the_rack
+debug: false
+debug_batch_size: 8
+debug_steps_per_task: 5
+double_batch_start: false
+ema_decay: 0.999
+exp_name: LiberoTrainPi05_RandER_01_order2
+freeze_filter: Nothing()
+fsdp_devices: 1
+keep_period: 5000
+learn_one_task_idx: -1
+log_interval: 100
+lr_schedule:
+  decay_lr: 5e-05
+  decay_steps: 1000000
+  peak_lr: 5e-05
+  warmup_steps: 10000
+max_to_keep: null
+model:
+  action_dim: 32
+  action_expert_variant: gemma_300m
+  action_horizon: 10
+  discrete_state_input: false
+  dtype: bfloat16
+  max_token_len: 200
+  paligemma_variant: gemma_2b
+  pi05: true
+  pytorch_compile_mode: max-autotune
+n_memories: 100
+n_memories_proportion: 0.01
+n_memories_total: true
+n_tasks: 10
+name: pi05_libero-libero_goal_sequential
+no_resampling: false
+num_train_steps: 50000
+num_workers: 2
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  clip_gradient_norm: 1
+  eps: 1e-08
+  weight_decay: 1e-10
+overwrite: false
+policy_metadata: null
+project_name: openpi
+pytorch_training_precision: bfloat16
+pytorch_weight_path: null
+resume: true
+save_end_of_task_only: true
+save_interval: 1000
+seed: 42
+steps_per_task: 5000
+task_order_index: 2
+task_order_permutation: null
+wandb_enabled: true
+weight_loader:
+  params_path: gs://openpi-assets/checkpoints/pi05_base/params
