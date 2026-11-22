@@ -1,9 +1,11 @@
-# MemoryAnchors_VLA
+# Memory Anchors for Continual Robot Learning
 
-<!-- TODO: paper title, authors, venue, and links (paper / arXiv / project page). -->
+Maximilian Du<sup>1</sup>, Zhanyi Sun<sup>1</sup>, Chen Xu<sup>2</sup>, Paarth Shah<sup>2</sup>, Masha Itkina<sup>2</sup>, Shuran Song<sup>1</sup><br>
+<sup>1</sup>Stanford University, <sup>2</sup>Toyota Research Institute
 
-Code for the π0.5 (vision-language-action) experiments on memory anchors in continual learning.
-The π0.5 policy is fine-tuned on the ten LIBERO-Goal tasks one after another, with experience
+**CoRL 2026** · [Paper (arXiv)](https://arxiv.org/abs/2608.26545) · [Project page](https://robot-adaptation.github.io/MemoryAnchors)
+
+This repository has the code for the paper's π0.5 (vision-language-action) experiments. The π0.5 policy is fine-tuned on the ten LIBERO-Goal tasks one after another, with experience
 replay, and we measure how adding or removing memory anchors in the replay buffer changes forgetting.
 
 This repository is built on [openpi](https://github.com/Physical-Intelligence/openpi) from Physical
@@ -115,12 +117,23 @@ openpi commit `15a9616`, we modified:
 - `examples/libero/convert_libero_data_to_lerobot.py`
 - `pyproject.toml`, `uv.lock`, `.gitignore`
 
-We removed openpi's GitHub CI workflows and moved its README to `OPENPI_README.md`. All other
+We removed openpi's GitHub CI workflows and `CODEOWNERS` file, and moved its README to
+`OPENPI_README.md`. All other
 additions are new files (see the table above, and `git diff --stat 15a9616 HEAD`).
 
 ## Citation
 
-<!-- TODO: BibTeX for the paper. -->
+```bibtex
+@misc{du2026memoryanchorscontinualrobot,
+      title={Memory Anchors for Continual Robot Learning},
+      author={Maximilian Du and Zhanyi Sun and Chen Xu and Paarth Shah and Masha Itkina and Shuran Song},
+      year={2026},
+      eprint={2608.26545},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2608.26545},
+}
+```
 
 Please also cite [openpi](https://github.com/Physical-Intelligence/openpi) and
 [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO).
